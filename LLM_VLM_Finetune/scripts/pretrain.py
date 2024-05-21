@@ -63,7 +63,7 @@ class PretrainConfig:
     # Pretraining Stage in < align (projector-only) | finetune (projector + LLM) | full-finetune (all) >
     # ---
     stage: str = "finetune" # align, finetune                                        # Pretraining Stage in < align | finetune >
-    pretrained_checkpoint: Path = Path("runs/align-stage+7b+stage-align+x7/checkpoints/latest-checkpoint.pt")# Optional[Path] = None                    # Pretrained Checkpoint to Load (for `finetune`)
+    pretrained_checkpoint: Optional[Path] = None                    # Pretrained Checkpoint to Load (for `finetune`)
                                                                     #   if None =>> will match on (run_dir / `align`)
 
     # Run Arguments
@@ -79,7 +79,7 @@ class PretrainConfig:
     # wandb_project: str = "prismatic"                                # Name of W&B project (default: `prismatic`)
     # wandb_entity: Optional[str] = None                              # Name of W&B entity (default: None)
     wandb_project: str = "vlm-toy"
-    wandb_entity: str = "xinyu-zhou"
+    wandb_entity: str = "XXXXXX"
 
     def __post_init__(self) -> None:
         """Set optimization parameters based on `stage` in {"align", "finetune"}."""

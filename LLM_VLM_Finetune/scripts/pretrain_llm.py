@@ -80,7 +80,7 @@ class PretrainConfig_LLM:
     # wandb_project: str = "prismatic"                                # Name of W&B project (default: `prismatic`)
     # wandb_entity: Optional[str] = None                              # Name of W&B entity (default: None)
     wandb_project: str = "llm-PIQA"
-    wandb_entity: str = "xinyu-zhou"
+    wandb_entity: str = "XXXXXXX"
 
     def __post_init__(self) -> None:
         """Set optimization parameters based on `stage` in {"align", "finetune"}."""
