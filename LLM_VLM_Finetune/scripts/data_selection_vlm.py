@@ -20,25 +20,29 @@ Run with:
     - [Single Node Multi-GPU (= $K)]: torchrun --standalone --nnodes 1 --nproc-per-node $K scripts/pretrain.py
     - [Multi-Node/AWS Sagemaker] Depends on your individual setup; file an issue if you have trouble!
 """
+
 import json
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union
 import pickle
+import gc
 import draccus
 import torch
+import numpy as np
 import torch.distributed as dist
 import yaml
-import numpy as np
 
 from prismatic.conf import DatasetConfig, DatasetRegistry, ModelConfig, ModelRegistry
-from prismatic.models import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm, get_llm
+from prismatic.conf.models import  ModelConfig, ModelRegistry
+from prismatic.models import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm
 from prismatic.overwatch import initialize_overwatch
-from prismatic.preprocessing.materialize import get_dataset_and_collator, get_dataset_and_collator_LLM
-from prismatic.training import Metrics, get_train_strategy, get_train_strategy_llm
+#from prismatic.preprocessing import get_dataset_and_collator
+from prismatic.preprocessing.materialize_DataPrune import get_dataset_and_collator
+from prismatic.training import Metrics, get_train_strategy
 from prismatic.util import set_global_seed
+from influence_func import IFEngine
 
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -48,22 +52,22 @@ overwatch = initialize_overwatch(__name__)
 
 
 @dataclass
-class PretrainConfig_LLM:
+class PretrainConfig:
     # fmt: off
 
     # ModelConfig (`prismatic/conf/models.py`); override with --model.type `ModelRegistry.<MODEL>.model_id`
     model: ModelConfig = field(
-        default_factory=ModelConfig.get_choice_class(ModelRegistry.Llama2_Math.model_id)
+        default_factory=ModelConfig.get_choice_class(ModelRegistry.PRISM_DINOSIGLIP_7B.model_id)
     )
 
     # DatasetConfig (`prismatic/conf/datasets.py`); override with --dataset.type `DatasetRegistry.<DATASET>.dataset_id`
     dataset: DatasetConfig = field(
-        default_factory=DatasetConfig.get_choice_class(DatasetRegistry.LLAMA2_MATH.dataset_id)
+        default_factory=DatasetConfig.get_choice_class(DatasetRegistry.LLAVA_V15.dataset_id)
     )
 
     # Pretraining Stage in < align (projector-only) | finetune (projector + LLM) | full-finetune (all) >
     # ---
-    stage: str = 'llm-finetune'# 'llama-dataset-pruning' #"llm-finetune"                                         # Pretraining Stage in < align | finetune >
+    stage: str = "data-pruning_llm"   # Pretraining Stage in < align | finetune >                              
     pretrained_checkpoint: Optional[Path] = None                    # Pretrained Checkpoint to Load (for `finetune`)
                                                                     #   if None =>> will match on (run_dir / `align`)
 
@@ -79,13 +83,26 @@ class PretrainConfig_LLM:
     trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
     # wandb_project: str = "prismatic"                                # Name of W&B project (default: `prismatic`)
     # wandb_entity: Optional[str] = None                              # Name of W&B entity (default: None)
-    wandb_project: str = "llm-PIQA"
-    wandb_entity: str = "XXXXXXX"
+    wandb_project: str = "XXXXX"
+    wandb_entity: str = "XXXXX"
 
     def __post_init__(self) -> None:
         """Set optimization parameters based on `stage` in {"align", "finetune"}."""
+        if self.stage == "align":
+            self.epochs = self.model.align_epochs
+            self.max_steps = self.model.align_max_steps
+            self.global_batch_size = self.model.align_global_batch_size
+            self.per_device_batch_size = self.model.align_per_device_batch_size
 
-        if self.stage.endswith("finetune") or self.stage == "llama-dataset-pruning" or self.stage == "inference":
+            self.learning_rate = self.model.align_learning_rate
+            self.weight_decay = self.model.align_weight_decay
+            self.max_grad_norm = self.model.align_max_grad_norm
+            self.lr_scheduler_type = self.model.align_lr_scheduler_type
+            self.warmup_ratio = self.model.align_warmup_ratio
+
+            self.train_strategy = self.model.align_train_strategy
+
+        elif self.stage.endswith("finetune") or self.stage == "data-pruning_projector" or self.stage == "data-pruning_llm":
             self.epochs = self.model.finetune_epochs
             self.max_steps = self.model.finetune_max_steps
             self.global_batch_size = self.model.finetune_global_batch_size
@@ -99,14 +116,15 @@ class PretrainConfig_LLM:
 
             self.train_strategy = self.model.finetune_train_strategy
 
-        
+        else:
+            raise ValueError(f"Stage `{self.stage}` is not supported!")
 
     # fmt: on
 
 
 @draccus.wrap()
-def pretrain(cfg: PretrainConfig_LLM) -> None:
-    overwatch.info("LLM Training :: Gathering Light")
+def pruning(cfg: PretrainConfig) -> None:
+    overwatch.info("Prismatic VLM Training :: Gathering Light")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := (overwatch.rank() % torch.cuda.device_count()))
@@ -132,6 +150,11 @@ def pretrain(cfg: PretrainConfig_LLM) -> None:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
 
+    # Load Vision Backbone --> on CPU, in Full Precision (initializing model, image_transform via TIMM)
+    overwatch.info(f"Loading Vision Backbone [bold]{cfg.model.vision_backbone_id}[/] via TIMM ")
+    vision_backbone, image_transform = get_vision_backbone_and_transform(
+        cfg.model.vision_backbone_id, image_resize_strategy=cfg.model.image_resize_strategy
+    )
 
     # Load LLM Backbone --> on CPU, in Full Precision (initializing Tokenizer + handling special tokens if necessary)
     overwatch.info(f"Loading Pretrained LLM [bold]{cfg.model.llm_backbone_id}[/] via HF Transformers")
@@ -139,49 +162,46 @@ def pretrain(cfg: PretrainConfig_LLM) -> None:
         cfg.model.llm_backbone_id, llm_max_length=cfg.model.llm_max_length, hf_token=hf_token
     )
 
-    vision_backbone, image_transform = get_vision_backbone_and_transform(
-        cfg.model.vision_backbone_id, image_resize_strategy=cfg.model.image_resize_strategy
-    )
-
     # Create VLM => wraps `vision_backbone` and `llm`
-    overwatch.info(f"Instantiating LLM `{model_id}` for Training Stage = `{cfg.stage}`")
-
-    llm = get_llm(
+    overwatch.info(f"Instantiating PrismaticVLM `{model_id}` for Training Stage = `{cfg.stage}`")
+    vlm = get_vlm(
         model_id,
+        cfg.model.arch_specifier,
         vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
     )
 
-    # for p, v in llm.llm_backbone.named_parameters():
-    #     print(p, v.shape)
-    # sys.exit(0)
-
-
     # [Explicit] Call to `freeze_backbones` here for clarity => will log exactly what is frozen / what's not!
-    overwatch.info(f"Invoking `LLM.freeze_backbones()` for `{model_id}` => Training Stage: `{cfg.stage}`")
-    llm.freeze_backbones(cfg.stage)
+    overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{model_id}` => Training Stage: `{cfg.stage}`")
+    vlm.freeze_backbones(cfg.stage)
 
     # Load Weights from Checkpoint (depends on stage, config)
-    overwatch.info(f"Invoking `LLM.load_checkpoint()` for `{model_id}` => Training Stage: `{cfg.stage}`")
-    llm.load_from_checkpoint(cfg.stage, run_dir, pretrained_checkpoint=cfg.pretrained_checkpoint)
+    overwatch.info(f"Invoking `VLM.load_checkpoint()` for `{model_id}` => Training Stage: `{cfg.stage}`")
+    overwatch.info(f"Loading Pretrained Checkpoint from `{cfg.pretrained_checkpoint}`")
+    vlm.load_from_checkpoint(cfg.stage, run_dir, pretrained_checkpoint=cfg.pretrained_checkpoint)
 
     # Get Dataset for Specified Stage
     overwatch.info(f"Creating Dataset `{cfg.dataset.dataset_id}` => Stage: `{cfg.stage}`")
-
-    train_dataset, val_dataset, collator, train_jsonl, val_jsonl = get_dataset_and_collator_LLM(
+    train_dataset, val_dataset, collator, train_annotation_json_path, val_annotation_json_path = get_dataset_and_collator(
         cfg.stage,
         cfg.dataset,
+        image_transform,
         tokenizer,
         prompt_builder_fn=llm_backbone.prompt_builder_fn,
+        default_image_resolution=vision_backbone.default_image_resolution,
         padding_side=tokenizer.padding_side,
     )
 
+    # for k,v in vlm.llm_backbone.named_parameters():
+    #     print(k, v.shape)
+    
+
     # Create Train Strategy
     overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
-    train_strategy = get_train_strategy_llm(
+    train_strategy = get_train_strategy(
         train_strategy=cfg.train_strategy,
-        llm=llm,
+        vlm=vlm,
         device_id=device_id,
         epochs=cfg.epochs,
         max_steps=cfg.max_steps,
@@ -199,38 +219,92 @@ def pretrain(cfg: PretrainConfig_LLM) -> None:
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
 
-   
 
 
-    ####################### LLM Finetune #######################
-#    Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
-    overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
-    metrics = Metrics(
-        cfg.trackers,
-        cfg.run_id,
-        run_dir,
-        draccus.encode(cfg),
-        cfg.stage,
-        wandb_project=cfg.wandb_project,
-        wandb_entity=cfg.wandb_entity,
-        grad_accumulation_steps=train_strategy.grad_accumulation_steps,
+    # Run Data Pruning
+    overwatch.info("Compute Gradient")
+    ## first compute the gradients of validation dataset
+    val_grad_dict = train_strategy.compute_val_gradient(
+        val_dataset,
+        collator,
+        seed=cfg.seed,
+        stage=cfg.stage,
+    ) ## {weight1: tensor; weight2: tensor; ...} avg of the gradients of each weight
+
+    ## save the val_grad_dict into pickle file
+    with open(run_dir / "val_grad_dict.pkl", "wb") as f:
+        pickle.dump(val_grad_dict, f)
+
+    # load pickle file
+    # with open(run_dir / "val_grad_dict.pkl", "rb") as f:
+    #     val_grad_dict = pickle.load(f)
+    #     overwatch.info("val_grad_dict loaded")
+
+
+    IF_dict = train_strategy.compute_training_samples_IF(
+        train_dataset,
+        val_grad_dict,
+        collator,
+        seed=cfg.seed,
+        stage=cfg.stage,
+        method='hyperinf',
     )
 
-   # Run Training
-    overwatch.info("Starting Training Loop")
-    train_strategy.run_training(train_dataset, collator, metrics, stage=cfg.stage, seed=cfg.seed)
+    iterative_if_dict = IF_dict['hyperinf']
+    with open(run_dir / "if_dict.pkl", "wb") as f:
+        pickle.dump(iterative_if_dict, f)
+    HighQuality_to_LowQuality_iterative = np.argsort(iterative_if_dict)
+    ## save the order of the data into pickle file
+    with open(run_dir / "HighQuality_to_LowQuality.pkl", "wb") as f:
+        pickle.dump(HighQuality_to_LowQuality_iterative, f)
+
+    ## load pickle file
+    # with open(run_dir / "if_dict.pkl", "rb") as f:
+    #     iterative_if_dict = pickle.load(f)
+    # with open(run_dir / "HighQuality_to_LowQuality.pkl", "rb") as f:
+    #     HighQuality_to_LowQuality_iterative = pickle.load(f)
+
+    n_train = len(iterative_if_dict)
+    del iterative_if_dict
+    gc.collect()
+
+    ratios = [0.2, 0.4, 0.6, 0.8]
+    n_train = len(HighQuality_to_LowQuality_iterative)
+
+    for ratio in ratios:
+        perct = int(ratio*100)
+        top_k = int(n_train*ratio)
+        print(f"top {perct}% of the data: {top_k}")
+        top_k_data = HighQuality_to_LowQuality_iterative[:top_k]
+        #del HighQuality_to_LowQuality_iterative
+        #gc.collect()
+
+        ## read train_annotation_json_path and use a list to store the data
+        with open(train_annotation_json_path, "r") as f:
+            data = json.load(f)
+        print(train_annotation_json_path)
+        print("len(data): ", len(data))
+
+        
+        # cnt=0
+        with open(f"data/download/llava-v1.5-instruct/train_val/llava_v1_5_train_10_percent_HyperINF_{perct}_perc_LLM_LastLayer.json", "w") as f:
+            json.dump([data[i] for i in top_k_data], f)
+    
+
+    gc.collect()
+    ###################
+
+  
 
     # Finalize
-    overwatch.info("Done with Training =>> Finalizing Metrics")
-    metrics.finalize()
+    overwatch.info("Done!")
+   
 
     # And... we're done!
     overwatch.info("... and that's all, folks!")
     dist.barrier()
     dist.destroy_process_group()
-    
-    ####################### LLM Finetune #######################
 
 
 if __name__ == "__main__":
-    pretrain()
+    pruning()

@@ -75,9 +75,9 @@ method_dict={
             'iterative': 'HyperINF',
             'LiSSA': 'LiSSA'
             }
-
+colors = ['green', 'yellow', 'red', 'blue']
 plt.figure(figsize=(5,4))
-
+idx = 0
 for method in influence_engine.IF_dict:
     detection_rate_list=[]
     low_quality_to_high_quality=np.argsort(influence_engine.IF_dict[method])[::-1]
@@ -91,16 +91,18 @@ for method in influence_engine.IF_dict:
     plt.plot(100*np.arange(len(low_quality_to_high_quality))/n_train,
             detection_rate_list,
             #marker='s',
+            color=colors[idx],
             label=method_dict[method])
     
+    idx += 1
 
 ## plot random detection rate from (0,0) to (100,100)
-plt.plot([0, 100], [0, 100], linestyle='--', color='black', label='Random')
+plt.plot([0, 100], [0, 100], linestyle='--', color='gray', label='Random')
 ## plot perfect detection rate from (0,0) to (20,100), (20,100) to (100,100)
 plt.plot([0, 20], [0, 100], linestyle='--', color='red', label='Perfect')
 plt.plot([20, 100], [100, 100], linestyle='--', color='red')
 plt.legend(fontsize=15)
 
-plt.savefig(f"{task}_r=32_detection_rate.pdf", bbox_inches='tight')
+plt.savefig(f"{task}_r=16_detection_rate.pdf", bbox_inches='tight')
 
 
