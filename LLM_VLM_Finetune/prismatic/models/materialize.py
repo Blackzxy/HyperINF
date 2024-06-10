@@ -123,14 +123,14 @@ def get_vlm(
 
 def get_llm(
         model_id: str,
-        vision_backbone: VisionBackbone,
+        # vision_backbone: VisionBackbone,
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
 ) -> PrismaticLLM:
     """Lightweight wrapper around initializing a LLM, mostly for future-proofing (if one wants to add a new LLM)."""
     return PrismaticLLM(
         model_id,
-        vision_backbone,
+       # vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=enable_mixed_precision_training,
     )

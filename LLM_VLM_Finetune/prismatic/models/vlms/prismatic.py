@@ -22,7 +22,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from prismatic.models.backbones.llm import LLMBackbone
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import VisionBackbone
-from prismatic.models.vlms.base_vlm import VLM
+from prismatic.models.vlms.base_vlm import VLM, LLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
 
@@ -34,18 +34,18 @@ overwatch = initialize_overwatch(__name__)
 IGNORE_INDEX = -100
 
 
-class PrismaticLLM(VLM):
+class PrismaticLLM(LLM):
     def __init__(
         self,
         model_id: str,
-        vision_backbone: VisionBackbone,
+        # vision_backbone: VisionBackbone,
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
     ) -> None:
         super().__init__(
             "prismatic",
             model_id,
-            vision_backbone,
+            # vision_backbone,
             llm_backbone,
             enable_mixed_precision_training=enable_mixed_precision_training,
         )
@@ -69,14 +69,14 @@ class PrismaticLLM(VLM):
         cls,
         pretrained_checkpoint: Path,
         model_id: str,
-        vision_backbone: VisionBackbone,
+        # vision_backbone: VisionBackbone,
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
     ) -> PrismaticLLM:
         """Initialize a PrismaticVLM from a pretrained checkpoint, freezing all weights, tailored for inference."""
         llm = cls(
             model_id,
-            vision_backbone,
+            # vision_backbone,
             llm_backbone,
             enable_mixed_precision_training=enable_mixed_precision_training,
         )
@@ -167,7 +167,7 @@ class PrismaticLLM(VLM):
 
     def get_fsdp_wrapping_policy(self) -> Callable:
         """Return an FSDP _or_policy over the policies returned by each individual backbone (and our VLM policy)."""
-        vision_fsdp_wrapping_policy = self.vision_backbone.get_fsdp_wrapping_policy()
+        # vision_fsdp_wrapping_policy = self.vision_backbone.get_fsdp_wrapping_policy()
         llm_fsdp_wrapping_policy = self.llm_backbone.get_fsdp_wrapping_policy()
 
         # Get Prismatic Wrapping Policy =>> just a module wrapping policy around `self.projector`
@@ -182,7 +182,7 @@ class PrismaticLLM(VLM):
         return partial(
             _or_policy,
             policies=[
-                vision_fsdp_wrapping_policy,
+                # vision_fsdp_wrapping_policy,
                 llm_fsdp_wrapping_policy,
                 prismatic_fsdp_wrapping_policy,
             ],

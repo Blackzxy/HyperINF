@@ -139,16 +139,16 @@ def pretrain(cfg: PretrainConfig_LLM) -> None:
         cfg.model.llm_backbone_id, llm_max_length=cfg.model.llm_max_length, hf_token=hf_token
     )
 
-    vision_backbone, image_transform = get_vision_backbone_and_transform(
-        cfg.model.vision_backbone_id, image_resize_strategy=cfg.model.image_resize_strategy
-    )
+    # vision_backbone, image_transform = get_vision_backbone_and_transform(
+    #     cfg.model.vision_backbone_id, image_resize_strategy=cfg.model.image_resize_strategy
+    # )
 
     # Create VLM => wraps `vision_backbone` and `llm`
     overwatch.info(f"Instantiating LLM `{model_id}` for Training Stage = `{cfg.stage}`")
 
     llm = get_llm(
         model_id,
-        vision_backbone,
+        #vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
     )
