@@ -21,10 +21,10 @@ import torch.nn as nn
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import AutoConfig, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
+from transformers import BitsAndBytesConfig
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.overwatch import initialize_overwatch
-
+from peft import get_peft_model 
 # Suppress HF Deprecation Warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -104,6 +104,8 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = False,
+        enable_peft = False,
+        lora_config=None,
     ) -> None:
         super().__init__(llm_backbone_id)
         self.llm_family = llm_family
@@ -115,22 +117,32 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         if not self.inference_mode:
             overwatch.info(f"Loading [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
 
-            
+            ### add quantization config
+            # quantization_config = BitsAndBytesConfig(
+            #     load_in_8bit=False,
+            #     load_in_4bit=False,
+            # )
             self.llm = llm_cls.from_pretrained(
                 hf_hub_path,
                 token=hf_token,
+                #quantization_config=quantization_config,
                 use_flash_attention_2=use_flash_attention_2 if not self.inference_mode else False,
                 # The following parameters are set to prevent `UserWarnings` from HF; we want greedy decoding!
                 do_sample=False,
                 temperature=1.0,
                 top_p=1.0,
             )
+            if enable_peft:
+                self.llm = get_peft_model(self.llm, lora_config)
 
         # [Contract] `inference_mode` means we're loading from a pretrained checkpoint; no need to load base weights!
         else:
             overwatch.info(f"Building empty [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
             llm_config = AutoConfig.from_pretrained(hf_hub_path, token=hf_token)
             self.llm = llm_cls._from_config(llm_config)
+
+            if enable_peft:
+                self.llm = get_peft_model(self.llm, lora_config)    
             #
             # print("DEBUG EMPTY LLM INITIALIZE")
             # import IPython

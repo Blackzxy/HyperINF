@@ -74,10 +74,10 @@ def load_llm(
         f"             Checkpoint Path =>> [underline]`{checkpoint_pt}`[/]"
     )
 
-    vision_backbone, image_transform = get_vision_backbone_and_transform(
-        model_cfg["vision_backbone_id"],
-        model_cfg["image_resize_strategy"],
-    )
+    # vision_backbone, image_transform = get_vision_backbone_and_transform(
+    #     model_cfg["vision_backbone_id"],
+    #     model_cfg["image_resize_strategy"],
+    # )
 
 
     # Load LLM Backbone --> note `inference_mode = True` by default when calling `load()`
@@ -92,9 +92,10 @@ def load_llm(
     # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
     overwatch.info(f"Loading LLM [bold blue]{model_cfg['model_id']}[/] from Checkpoint; Freezing Weights 🥶")
     vlm = PrismaticLLM.from_pretrained(
+        model_id_or_path,
         checkpoint_pt,
         model_cfg["model_id"],
-        vision_backbone,
+        # vision_backbone,
         llm_backbone,
     )
 

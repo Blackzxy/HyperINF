@@ -171,6 +171,7 @@ class TextVQATaskDataset(Dataset[Dict[str, torch.Tensor]]):
 class LLMFinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
     def __init__(
         self,
+        is_jsonl: bool,
         instruct_jsonl: Path,
         tokenizer: PreTrainedTokenizerBase,
         prompt_builder_fn: Type[PromptBuilder],
@@ -180,10 +181,17 @@ class LLMFinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         self.tokenizer = tokenizer
         self.prompt_builder_fn = prompt_builder_fn
         self.dataset_type = "finetune"
+        self.is_jsonl = is_jsonl
 
-        # Load jsonl file
-        with open(self.instruct_jsonl, "r") as f:
-            self.examples = [json.loads(line) for line in f]
+        # # Load jsonl file for QA dataset
+        if self.is_jsonl:
+            with open(self.instruct_jsonl, "r") as f:
+                self.examples = [json.loads(line) for line in f]
+
+        ## Load JSON file for oasst1 dataset
+        else:
+            with open(self.instruct_jsonl, "r") as f:
+                self.examples = json.load(f)
 
 
     # === Unimodal + Multimodal Handling ===
@@ -200,34 +208,67 @@ class LLMFinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         :return: Dictionary of {"pixel_values": torch.Tensor, "input_ids": torch.Tensor, "labels": torch.Tensor}
         """
 
-        if "passage" in self.examples[idx]:
-            passage = self.examples[idx]["passage"]
-            question = self.examples[idx]["question"]
-            question = passage + "\n" + question
-            answer = str(self.examples[idx]["answer"]["number"])
-            # type_q = self.examples[idx]["type"]
+        # ### For QA dataset format
+        if self.is_jsonl:
+            if "passage" in self.examples[idx]:
+                passage = self.examples[idx]["passage"]
+                question = self.examples[idx]["question"]
+                question = passage + "\n" + question
+                answer = str(self.examples[idx]["answer"]["number"])
+                # type_q = self.examples[idx]["type"]
 
-        else:
-            question = self.examples[idx]["question"]
-            answer = str(self.examples[idx]["answer"])
-            # if "type" in self.examples[idx]:
-            #     type_q = self.examples[idx]["type"]
+            else:
+                question = self.examples[idx]["question"]
+                answer = str(self.examples[idx]["answer"])
+                # if "type" in self.examples[idx]:
+                #     type_q = self.examples[idx]["type"]
 
-    
-
-        # Create Prompt Builder --> add each message sequentially
-        prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
-
-        msg = question + "\n" + answer
-        #prompt_builder.get_potential_prompt(question + "\n" + answer)
-        if isinstance(self.tokenizer, LlamaTokenizerFast):
-                msg = msg.rstrip()
-        else:
-            raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
         
-        input_ids = self.tokenizer(msg, add_special_tokens=True).input_ids
-        labels = input_ids
 
+            # Create Prompt Builder --> add each message sequentially
+            prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
+
+            msg = question + "\n" + answer
+
+            #prompt_builder.get_potential_prompt(question + "\n" + answer)
+            if isinstance(self.tokenizer, LlamaTokenizerFast):
+                    msg = msg.rstrip()
+            else:
+                raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
+            
+            input_ids = self.tokenizer(msg, add_special_tokens=True).input_ids
+            labels = input_ids
+            ### For QA dataset format
+
+        # ### For oasst1 dataset format
+        else:
+            conversation = self.examples[idx]["conversations"]
+            # conversation_cp = copy.deepcopy(conversation)
+            # conversation = None
+
+            # Create Prompt Builder --> add each message sequentially
+            prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
+            for turn_idx, turn in enumerate(conversation):
+                # Get "effective" string added to prompt --> handle whitespace for tokenizer type!
+                msg = prompt_builder.add_turn(turn["from"], turn["value"])
+
+                # Llama Tokenizer (Fast) adds extra character if a string ends in whitespace --> strip if non-empty!
+                if isinstance(self.tokenizer, LlamaTokenizerFast):
+                    msg = msg.rstrip()
+                else:
+                    raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
+
+                # Tokenize Input IDs
+                turn_input_ids = self.tokenizer(msg, add_special_tokens=turn_idx == 0).input_ids
+
+                # [CRITICAL] We do not want to take the loss for the "USER: <msg>" prompts =>> just the responses!
+                turn_labels = (
+                    [IGNORE_INDEX for _ in range(len(turn_input_ids))] if (turn_idx % 2) == 0 else list(turn_input_ids)
+                )
+
+                # Add to Trackers
+                input_ids.extend(turn_input_ids)
+                labels.extend(turn_labels)
 
         # Tensorize =>> Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches after)
         #   - IMPORTANT => IF WE'RE USING HF LLM.forward(... labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!

@@ -9,7 +9,7 @@ import torch
 from torch import nn as nn
 from transformers import LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-
+from transformers import BitsAndBytesConfig
 from prismatic.models.backbones.llm.base_llm import HFCausalLLMBackbone
 from prismatic.models.backbones.llm.prompting import (
     LLaMa2ChatPromptBuilder,
@@ -17,6 +17,7 @@ from prismatic.models.backbones.llm.prompting import (
     PurePromptBuilder,
     VicunaV15ChatPromptBuilder,
 )
+from peft import LoraConfig
 
 # Registry =>> Support LLaMa-2 Models (from HF Transformers)
 # fmt: off
@@ -59,6 +60,14 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = True,
+        enable_peft=True,
+        lora_config = LoraConfig(
+            r=64,
+            lora_alpha=2*64,
+            target_modules=['q_proj','v_proj'],
+            task_type="CAUSAL_LM",
+            use_rslora=True,
+        )
     ) -> None:
         super().__init__(
             llm_backbone_id,
@@ -66,13 +75,15 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
             hf_token=hf_token,
             inference_mode=inference_mode,
             use_flash_attention_2=use_flash_attention_2,
+            enable_peft=enable_peft,
+            lora_config=lora_config,
             **LLAMA2_MODELS[llm_backbone_id],
         )
 
         # [Special Case] LLaMa-2 PAD Token Handling --> for clarity, we add an extra token (and resize)
         self.tokenizer.add_special_tokens({"pad_token": "<PAD>"})
         self.llm.config.pad_token_id = self.tokenizer.pad_token_id
-        self.llm.resize_token_embeddings(len(self.tokenizer), pad_to_multiple_of=64)
+        self.llm.resize_token_embeddings(len(self.tokenizer), 64)
 
     @property
     def prompt_builder_fn(self) -> Type[PromptBuilder]:

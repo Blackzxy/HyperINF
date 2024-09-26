@@ -13,7 +13,7 @@ from __future__ import annotations
 from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Union
-
+import sys
 import torch
 from PIL import Image
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
@@ -25,6 +25,12 @@ from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.vlms.base_vlm import VLM, LLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
+
+from peft import (
+    LoraConfig,
+    PeftModel,
+    get_peft_model
+)
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -67,6 +73,7 @@ class PrismaticLLM(LLM):
     @classmethod
     def from_pretrained(
         cls,
+        model_path: Path,
         pretrained_checkpoint: Path,
         model_id: str,
         # vision_backbone: VisionBackbone,
@@ -88,6 +95,10 @@ class PrismaticLLM(LLM):
         ), "PrismaticLLM `from_pretrained` expects checkpoint with keys for `llm_backbone`!"
 
         llm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+
+        print(model_path)
+        # torch.save(llm.llm_backbone, f"{model_path}/hf_ckpt/pytorch_model.bin")
+        # sys.exit(0)
 
         # Freeze Weights
         llm.requires_grad_(False)
@@ -128,6 +139,12 @@ class PrismaticLLM(LLM):
             # Explicitly Log Frozen / Unfrozen Components
            
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
+        
+        elif stage == 'llama-lora-dataset-pruning':
+            ## we apply the LoRA to llm backbone
+
+            overwatch.info(f"LLM Trainable Params (Millions) = `{round(sum(p.numel() for p in self.llm_backbone.parameters() if p.requires_grad)/1e6,2)}`", ctx_level=1)
+
 
         elif stage == "inference":
             ## third we freeze the LLM's parameters and only train the projector
@@ -137,11 +154,19 @@ class PrismaticLLM(LLM):
             self.trainable_module_keys = ["llm_backbone"]
 
             # Explicitly Log Frozen / Unfrozen Components
+           
             overwatch.info(f"[FROZEN] ❄️ =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
 
         elif stage == "llm-finetune":
             
+            # self.llm_backbone.requires_grad_(False)
+
+            # for n, p in self.llm_backbone.named_parameters():
+            #     if "layers.31" in n:
+            #         p.requires_grad = True
+
             self.llm_backbone.requires_grad_(True)
+
 
             # Add to `self.trainable_module_keys`
             self.trainable_module_keys = ["llm_backbone"]
@@ -149,6 +174,7 @@ class PrismaticLLM(LLM):
 
 
             # Explicitly Log Frozen / Unfrozen Components
+            overwatch.info(f"LLM Trainable Params (Millions) = `{round(sum(p.numel() for p in self.llm_backbone.parameters() if p.requires_grad)/1e6,2)}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
 
        
@@ -157,7 +183,15 @@ class PrismaticLLM(LLM):
 
     def load_from_checkpoint(self, stage: str, run_dir: Path, pretrained_checkpoint: Optional[Path] = None) -> None:
         """Load weights from checkpoint (if required by the given stage)."""
-        assert stage in {"llama-dataset-pruning", "llm-finetune", "inference"}, f"Stage {stage} is not supported!"
+        assert stage in {"llama-dataset-pruning", "llm-finetune", "inference", "llama-lora-dataset-pruning"}, f"Stage {stage} is not supported!"
+
+        if pretrained_checkpoint is not None:
+            overwatch.info(f"Loading from Provided Checkpoint `{pretrained_checkpoint}`", ctx_level=1)
+            model_state_dict = torch.load(pretrained_checkpoint)["model"]
+            print(model_state_dict.keys())
+            self.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+
+            return
 
         overwatch.info(
                 f"LLM does not require pretrained weights!", ctx_level=1
@@ -718,7 +752,7 @@ class PrismaticVLM(VLM):
         """
         if stage == "align":
             self.vision_backbone.requires_grad_(False)
-            self.llm_backbone.requires_grad_(False)
+            #self.llm_backbone.requires_grad_(False)
             self.projector.requires_grad_(True)
 
             # Add to `self.trainable_module_keys`
@@ -731,6 +765,8 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"Trainable Params (Millions) = `{round(sum(p.numel() for p in self.llm_backbone.parameters() if p.requires_grad)/1e6,2)}`", ctx_level=1)
+
 
         elif stage == "data-pruning_projector":
             ## first we only choose the Projector's parameters as the theta for 
@@ -774,10 +810,21 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[Frozen]    🥶 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+        
+        elif stage == "data-pruning_lora":
+            self.vision_backbone.requires_grad_(False)
+            #self.llm_backbone.requires_grad_(False)
+            self.projector.requires_grad_(True)
+
+            self.trainable_module_keys = ["projector", "llm_backbone"]
+            self.vision_backbone_requires_grad = False
+
+            overwatch.info(f"Trainable Params (Millions) = `{round(sum(p.numel() for p in self.llm_backbone.parameters() if p.requires_grad)/1e6,2)}`", ctx_level=1)
+
 
         elif stage == "finetune":
             self.vision_backbone.requires_grad_(False)
-            self.llm_backbone.requires_grad_(True)
+            #self.llm_backbone.requires_grad_(True)
             self.projector.requires_grad_(True)
 
             # Add to `self.trainable_module_keys`
@@ -791,6 +838,8 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"Trainable Params (Millions) = `{round(sum(p.numel() for p in self.llm_backbone.parameters() if p.requires_grad)/1e6,2)}`", ctx_level=1)
+
 
         elif stage == "full-finetune":
             self.vision_backbone.dtype = torch.float32
@@ -814,7 +863,7 @@ class PrismaticVLM(VLM):
 
     def load_from_checkpoint(self, stage: str, run_dir: Path, pretrained_checkpoint: Optional[Path] = None) -> None:
         """Load weights from checkpoint (if required by the given stage)."""
-        assert stage in {"align","data-pruning_projector","data-pruning_llm", "finetune", "full-finetune"}, f"Stage {stage} is not supported!"
+        assert stage in {"align","data-pruning_projector","data-pruning_llm","data-pruning_lora", "finetune", "full-finetune"}, f"Stage {stage} is not supported!"
 
         # If we're running a `no-align` architecture, we're good!
         if self.arch_specifier.startswith("no-align"):

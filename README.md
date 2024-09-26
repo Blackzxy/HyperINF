@@ -12,7 +12,7 @@ You can run `python Mislabeled_Data_Detection/test.py` to see the performance co
 ## Data Selection for LLM and VLM
 We ultilize the code of [Prismatic-VLM](https://github.com/TRI-ML/prismatic-vlms/tree/main), please clone that repo first, and follow the instruction of it to build the environment and download the dataset (it could be large for VLM, so it will take a while to download).
 
-For Data selection for LLM, we choose the datasets which are available in HuggingFace: [OpenBookQA](https://huggingface.co/datasets/allenai/openbookqa), [PIQA](https://github.com/ybisk/ybisk.github.io/tree/master/piqa/data), [LogiQA](https://huggingface.co/datasets/lucasmccabe/logiqa) and [CommonSenseQA](https://huggingface.co/datasets/tau/commonsense_qa).
+For Data selection for LLM, we choose the datasets which are available in HuggingFace: [QASC](https://huggingface.co/datasets/allenai/qasc?row=9), [PIQA](https://github.com/ybisk/ybisk.github.io/tree/master/piqa/data), [LogiQA](https://huggingface.co/datasets/lucasmccabe/logiqa) and [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag).
 
 We modify the original codes to support only LLM and data selection for both LLM and VLM. We provide the modified codes in `LLM_VLM_Finetune/scripts` and `LLM_VLM_Finetune/prismatic`. You can add and replace the files in the original repo with the files in our repo.
 

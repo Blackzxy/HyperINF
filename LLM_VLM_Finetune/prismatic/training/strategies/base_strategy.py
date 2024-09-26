@@ -14,7 +14,8 @@ import copy
 import numpy as np
 import pandas as pd
 import gc
-
+import pickle
+import json
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -307,7 +308,7 @@ class TrainingStrategy(ABC):
                         del v.grad, tmp_grad
 
             ### use the last layer gradients
-            else:
+            elif stage == "data-pruning_llm":
                 for k,v, in self.vlm.llm_backbone.named_parameters():
                     if v.grad is not None:
 
@@ -322,12 +323,52 @@ class TrainingStrategy(ABC):
                                 val_grad_dict_avg[k] += tmp_grad
                             skip_fg = False
                             del v.grad, tmp_grad
+            
+            elif stage == "data-pruning_lora":
+                for k, v in self.vlm.projector.named_parameters():
+                    if v.grad is not None:
+                        tmp_grad = v.grad.detach()
+                        if len(tmp_grad.shape)==1:
+                            tmp_grad = tmp_grad.unsqueeze(0)
+                        
+                        if k not in val_grad_dict_avg:
+                            val_grad_dict_avg[k] = tmp_grad
+                        else:
+                            val_grad_dict_avg[k] += tmp_grad
+                        skip_fg = False
+                        del v.grad, tmp_grad
+
+                for k, v in self.vlm.llm_backbone.named_parameters():
+                    if "lora_A" in k:
+                        tmp_grad = v.grad.detach()
+                        if len(tmp_grad.shape)==1:
+                            tmp_grad = tmp_grad.unsqueeze(0)
+                        if k not in val_grad_dict_avg:
+                            val_grad_dict_avg[k] = tmp_grad
+                        else:
+                            val_grad_dict_avg[k] += tmp_grad
+                        skip_fg = False
+                        del v.grad, tmp_grad
+                    
+                    elif "lora_B" in k:
+                        tmp_grad = v.grad.detach().T
+                        if len(tmp_grad.shape)==1:
+                            tmp_grad = tmp_grad.unsqueeze(0)
+                        if k not in val_grad_dict_avg:
+                            val_grad_dict_avg[k] = tmp_grad
+                        else:
+                            val_grad_dict_avg[k] += tmp_grad
+                        skip_fg = False
+                        del v.grad, tmp_grad
                         
             
             if skip_fg:
                 continue
 
             cnt+=1
+            
+            # if cnt>=10:
+            #     break
 
             del output, loss
             torch.cuda.empty_cache()
@@ -340,13 +381,15 @@ class TrainingStrategy(ABC):
     
     def compute_training_samples_IF(
         self,
+        run_dir,
         train_dataset: Dataset,
         val_grad_dict_avg: dict,
         collator: PaddedCollatorForLanguageModeling,
         batch_construction_strategy: str = "split-modality",
         seed: int = 7,
         stage: str = "data-pruning_llm",
-        method: str = "hyperinf"
+        method: str = "hyperinf",
+
     ) -> None:
 
         # Create a DataLoader with the initialized sampler, per-device-bsz, and collator
@@ -422,7 +465,7 @@ class TrainingStrategy(ABC):
                             
                             skip_fg = False
                             del v.grad, tmp_grad
-                else:
+                elif stage == "data-pruning_llm":
                     for k,v, in self.vlm.llm_backbone.named_parameters():
                         if v.grad is not None:
 
@@ -437,6 +480,43 @@ class TrainingStrategy(ABC):
                                     lambda_l[k] += torch.mean(tmp_grad**2)
                                 skip_fg = False
                                 del v.grad, tmp_grad
+                
+                elif stage == "data-pruning_lora":
+
+                    for k, v in self.vlm.projector.named_parameters():
+                        if v.grad is not None:
+                            tmp_grad = v.grad.detach()
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            
+                            if k not in lambda_l:
+                                lambda_l[k] = torch.mean(tmp_grad**2)
+                            else:
+                                lambda_l[k] += torch.mean(tmp_grad**2)
+                            del v.grad, tmp_grad
+
+                    for k, v in self.vlm.llm_backbone.named_parameters():
+                        if "lora_A" in k:
+                            tmp_grad = v.grad.detach()
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if k not in lambda_l:
+                                lambda_l[k] = torch.mean(tmp_grad**2)
+                            else:
+                                lambda_l[k] += torch.mean(tmp_grad**2)
+                            skip_fg = False
+                            del v.grad, tmp_grad
+                        
+                        elif "lora_B" in k:
+                            tmp_grad = v.grad.detach().T
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if k not in lambda_l:
+                                lambda_l[k] = torch.mean(tmp_grad**2)
+                            else:
+                                lambda_l[k] += torch.mean(tmp_grad**2)
+                            skip_fg = False
+                            del v.grad, tmp_grad
                 
                 if skip_fg:
                     continue
@@ -453,61 +533,88 @@ class TrainingStrategy(ABC):
             
         
 
-
-        for tr_idx, batch in enumerate(tqdm(train_dataloader)):
-            
-           
-            self.vlm.zero_grad(set_to_none=True)
-            skip_fg = True
-            output: CausalLMOutputWithPast = self.vlm(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch["pixel_values"],
-                labels=batch["labels"],
-                multimodal_indices=batch["multimodal_indices"],
-            )
-            loss = output.loss
-            if loss.requires_grad == False:
-                loss.requires_grad_(True)
-            loss.backward()
-            
-            ## only use the projector gradients
-            if stage == "data-pruning_projector":
-                for k,v in self.vlm.projector.named_parameters():
-                    ## check if v.grad is None
-                    if v.grad is not None:
-                        tmp_grad = v.grad.detach()
-                        if len(tmp_grad.shape)==1:
-                            tmp_grad = tmp_grad.unsqueeze(0)
-
-                        if method == "hyperinf" or method == "lissa":
-                            if k not in G_l:
-                                G_l[k] = tmp_grad.T @ tmp_grad
-                            else:
-                                G_l[k] += tmp_grad.T @ tmp_grad
-                            
-                            if k not in lambda_l:
-                                lambda_l[k] = torch.mean(tmp_grad**2)
-                            else:
-                                lambda_l[k] += torch.mean(tmp_grad**2)
-                        
-                        
-                        elif method == "datainf":
-                            if k not in ratio_l:
-                                ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
-                            else:
-                                ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
-                        
-                        skip_fg = False
-                        del v.grad, tmp_grad
+        if method != "hessian_free":
+            for tr_idx, batch in enumerate(tqdm(train_dataloader)):
                 
+            
+                self.vlm.zero_grad(set_to_none=True)
+                skip_fg = True
+                output: CausalLMOutputWithPast = self.vlm(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                    labels=batch["labels"],
+                    multimodal_indices=batch["multimodal_indices"],
+                )
+                loss = output.loss
+                if loss.requires_grad == False:
+                    loss.requires_grad_(True)
+                loss.backward()
+                
+                ## only use the projector gradients
+                if stage == "data-pruning_projector":
+                    for k,v in self.vlm.projector.named_parameters():
+                        ## check if v.grad is None
+                        if v.grad is not None:
+                            tmp_grad = v.grad.detach()
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
 
-            ### use the last layer gradients
-            elif stage == "data-pruning_llm":
-                for k,v in self.vlm.llm_backbone.named_parameters():
-                    if v.grad is not None:
-                        
-                        if '31' in k:
+                            if method == "hyperinf" or method == "lissa":
+                                if k not in G_l:
+                                    G_l[k] = tmp_grad.T @ tmp_grad
+                                else:
+                                    G_l[k] += tmp_grad.T @ tmp_grad
+                                
+                                if k not in lambda_l:
+                                    lambda_l[k] = torch.mean(tmp_grad**2)
+                                else:
+                                    lambda_l[k] += torch.mean(tmp_grad**2)
+                            
+                            
+                            elif method == "datainf":
+                                if k not in ratio_l:
+                                    ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                                else:
+                                    ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                            
+                            skip_fg = False
+                            del v.grad, tmp_grad
+                    
+
+                ### use the last layer gradients
+                elif stage == "data-pruning_llm":
+                    for k,v in self.vlm.llm_backbone.named_parameters():
+                        if v.grad is not None:
+                            
+                            if '31' in k:
+                                tmp_grad = v.grad.detach()
+                                if len(tmp_grad.shape)==1:
+                                    tmp_grad = tmp_grad.unsqueeze(0)
+                                
+                                if method == "hyperinf" or method == "lissa":
+                                    if k not in G_l:
+                                        G_l[k] = tmp_grad.T @ tmp_grad
+                                    else:
+                                        G_l[k] += tmp_grad.T @ tmp_grad
+                                    
+                                    if k not in lambda_l:
+                                        lambda_l[k] = torch.mean(tmp_grad**2)
+                                    else:
+                                        lambda_l[k] += torch.mean(tmp_grad**2)
+
+                                elif method == "datainf":
+                                    if k not in ratio_l:
+                                        ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                                    else:
+                                        ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                                
+                            
+                                skip_fg = False
+                                del v.grad, tmp_grad
+                elif stage == "data-pruning_lora":
+                    for k, v in self.vlm.projector.named_parameters():
+                        if v.grad is not None:
                             tmp_grad = v.grad.detach()
                             if len(tmp_grad.shape)==1:
                                 tmp_grad = tmp_grad.unsqueeze(0)
@@ -522,35 +629,85 @@ class TrainingStrategy(ABC):
                                     lambda_l[k] = torch.mean(tmp_grad**2)
                                 else:
                                     lambda_l[k] += torch.mean(tmp_grad**2)
+                                
+                            elif method == "datainf":
+                                if k not in ratio_l:
+                                    ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                                else:
+                                    ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
 
+                            skip_fg = False
+                            del v.grad, tmp_grad
+
+                    for k, v in self.vlm.llm_backbone.named_parameters():
+                        if "lora_A" in k:
+                            tmp_grad = v.grad.detach()
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if method == "hyperinf" or method == "lissa":
+                                if k not in G_l:
+                                    G_l[k] = tmp_grad.T @ tmp_grad
+                                else:
+                                    G_l[k] += tmp_grad.T @ tmp_grad
+                                
+                                if k not in lambda_l:
+                                    lambda_l[k] = torch.mean(tmp_grad**2)
+                                else:
+                                    lambda_l[k] += torch.mean(tmp_grad**2)
+                            
                             elif method == "datainf":
                                 if k not in ratio_l:
                                     ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
                                 else:
                                     ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
                             
-                        
                             skip_fg = False
                             del v.grad, tmp_grad
+                        
+                        elif "lora_B" in k:
+                            tmp_grad = v.grad.detach().T
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if method == "hyperinf" or method == "lissa":
+                                if k not in G_l:
+                                    G_l[k] = tmp_grad.T @ tmp_grad
+                                else:
+                                    G_l[k] += tmp_grad.T @ tmp_grad
+                                
+                                if k not in lambda_l:
+                                    lambda_l[k] = torch.mean(tmp_grad**2)
+                                else:
+                                    lambda_l[k] += torch.mean(tmp_grad**2)
+                            
+                            elif method == "datainf":
+                                if k not in ratio_l:
+                                    ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                                else:
+                                    ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                            
+                            skip_fg = False
+                            del v.grad, tmp_grad
+                
+                if skip_fg:
+                    continue
+                
+
+                cnt+=1
+
+                # if cnt>=10:
+                #     break
+
+                del output, loss
+                torch.cuda.empty_cache()
+
+                # ## save tr_idx, cnt, G_l, lambda_l
+                if cnt%1000==0:
+                    np.save('tr_idx.npy', tr_idx)
+                    np.save('cnt.npy', cnt)
+                    np.save('G_l.npy', G_l)
+                    np.save('lambda_l.npy', lambda_l)
+                    # np.save('ratio_l.npy', ratio_l)
             
-            if skip_fg:
-                continue
-            
-
-            cnt+=1
-
-
-            del output, loss
-            torch.cuda.empty_cache()
-
-            # ## save tr_idx, cnt, G_l, lambda_l
-            if cnt%1000==0:
-                np.save('tr_idx.npy', tr_idx)
-                np.save('cnt.npy', cnt)
-                np.save('G_l.npy', G_l)
-                np.save('lambda_l.npy', lambda_l)
-                # np.save('ratio_l.npy', ratio_l)
-        
 
         ####################### HyperINF method ############################
         if method == "hyperinf":
@@ -615,13 +772,17 @@ class TrainingStrategy(ABC):
         ########################## Hessian-Free method ############################
         
 
-
+        with open(run_dir / f"hvp_dict_{method}.pkl", "wb") as f:
+            pickle.dump(hvp_dict, f)
 
         ########################### compute IF score ############################
         
         IF_dict = {}
         for mtd in hvp_dict.keys():
             if_tmp_dict = {}
+            if_tmp_proj_dict = {}
+            if_tmp_llm_dict = {}
+
             cnt=0
             for tr_id, batch in enumerate(tqdm(train_dataloader)): # iterate over the training dataset
                 
@@ -641,6 +802,8 @@ class TrainingStrategy(ABC):
                 
                 ## we only store the gradients of the trainable modules
                 if_tmp_score = 0
+                if_tmp_proj_score = 0
+                if_tmp_llm_score = 0
 
                 ## only use the projector gradients
                 if stage == "data-pruning_projector":
@@ -656,7 +819,7 @@ class TrainingStrategy(ABC):
 
 
                 ## use the last layer gradients
-                else:
+                elif stage == "data-pruning_llm":
                     for k,v in self.vlm.llm_backbone.named_parameters():
                         if v.grad is not None:
                         
@@ -667,7 +830,34 @@ class TrainingStrategy(ABC):
                                 if_tmp_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
                                 skip_fg = False
                                 del v.grad, tmp_grad
+                                
+                elif stage == "data-pruning_lora":
+                    
+                    for k, v in self.vlm.projector.named_parameters():
+                        if v.grad is not None:
+                            tmp_grad = v.grad.detach()
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if_tmp_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
+                            if_tmp_proj_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
+                            skip_fg = False
+                            del v.grad, tmp_grad
 
+
+                    for k, v in self.vlm.llm_backbone.named_parameters():
+                        if "lora_A" in k or "lora_B" in k:
+                            if "lora_A" in k:
+                                tmp_grad = v.grad.detach()
+                            else:
+                                tmp_grad = v.grad.detach().T
+
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if_tmp_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
+                            if_tmp_llm_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
+                            skip_fg = False
+                            del v.grad, tmp_grad
+                        
                         
                 
                 if skip_fg:
@@ -677,8 +867,13 @@ class TrainingStrategy(ABC):
 
                 cnt+=1
 
-                print(-if_tmp_score)
+                # if cnt>=10:
+                #     break
+
+                print(-if_tmp_score, -if_tmp_proj_score, -if_tmp_llm_score)
                 if_tmp_dict[tr_id] = -if_tmp_score.cpu().detach().numpy()
+                if_tmp_proj_dict[tr_id] = -if_tmp_proj_score.cpu().detach().numpy()
+                if_tmp_llm_dict[tr_id] = -if_tmp_llm_score.cpu().detach().numpy()
 
                 
                 del output, loss                
@@ -690,6 +885,8 @@ class TrainingStrategy(ABC):
                     np.save('if_tmp_dict.npy', if_tmp_dict)
             
             IF_dict[mtd] = pd.Series(if_tmp_dict, dtype=float).to_numpy()
+            IF_dict[mtd+'_proj'] = pd.Series(if_tmp_proj_dict, dtype=float).to_numpy()
+            IF_dict[mtd+'_llm'] = pd.Series(if_tmp_llm_dict, dtype=float).to_numpy()
         
         return IF_dict
         
@@ -883,6 +1080,7 @@ class TrainingStrategyLLM(ABC):
 
             # Save checkpoint at end each epoch (if `self.max_steps` is None)
             if self.max_steps is None:
+                ## TODO: add eval
                 self.save_checkpoint(metrics.run_dir, metrics.global_step, epoch, loss.item())
                 dist.barrier()
 
@@ -933,20 +1131,46 @@ class TrainingStrategyLLM(ABC):
 
     
 
-            for k,v, in self.llm.llm_backbone.named_parameters():
+            # for k,v, in self.llm.llm_backbone.named_parameters():
                 
-                if "layers.31" in k:
-                    #if "31" in k:
+            #     if "layers.31" in k:
+            #         #if "31" in k:
+            #         tmp_grad = v.grad.detach()
+            #         if len(tmp_grad.shape)==1:
+            #             tmp_grad = tmp_grad.unsqueeze(0)
+                        
+            #         if k not in val_grad_dict_avg:
+            #             val_grad_dict_avg[k] = tmp_grad
+            #         else:
+            #             val_grad_dict_avg[k] += tmp_grad
+                
+            #         del v.grad, tmp_grad
+
+            for k,v in self.llm.llm_backbone.named_parameters():
+                if "lora_A" in k:
                     tmp_grad = v.grad.detach()
+                    #print(v[0])
                     if len(tmp_grad.shape)==1:
                         tmp_grad = tmp_grad.unsqueeze(0)
-                        
                     if k not in val_grad_dict_avg:
                         val_grad_dict_avg[k] = tmp_grad
                     else:
                         val_grad_dict_avg[k] += tmp_grad
-                
+                    
                     del v.grad, tmp_grad
+                
+                elif "lora_B" in k:
+                    tmp_grad = v.grad.detach().T
+                    if len(tmp_grad.shape)==1:
+                        tmp_grad = tmp_grad.unsqueeze(0)
+                    if k not in val_grad_dict_avg:
+                        val_grad_dict_avg[k] = tmp_grad
+                    else:
+                        val_grad_dict_avg[k] += tmp_grad
+                    
+                    del v.grad, tmp_grad
+                
+               
                             
 
             
@@ -964,6 +1188,8 @@ class TrainingStrategyLLM(ABC):
     
     def compute_training_samples_IF(
         self,
+        run_dir: Path,
+        train_jsonl: Path,
         train_dataset: Dataset,
         val_grad_dict_avg: dict,
         collator: PaddedCollatorForLanguageModeling,
@@ -1009,11 +1235,86 @@ class TrainingStrategyLLM(ABC):
         G_l_inv = {} ## G inverse for each layer
         lambda_const = 10
         hvp_dict = {}
+        h_dict={}
         ratio_l = {}
 
-        ## compute the lambda_l for each layer first for DATAINF method
-        if method == "datainf":
+        # ## compute the lambda_l for each layer first for DATAINF method
+        # if method == "datainf":
+        #     for tr_idx, batch in enumerate(tqdm(train_dataloader)):
+            
+        #         self.llm.zero_grad(set_to_none=True)
+        #         skip_fg = True
+        #         output: CausalLMOutputWithPast = self.llm(
+        #             input_ids=batch["input_ids"],
+        #             attention_mask=batch["attention_mask"],
+        #             labels=batch["labels"],
+        #         )
+        #         loss = output.loss
+        #         if loss.requires_grad == False:
+        #             loss.requires_grad_(True)
+        #         loss.backward()
+                
+
+        #         for k,v, in self.llm.llm_backbone.named_parameters():
+        #             # if v.grad is not None:
+        
+        #                 # if "layers.31" in k:
+        #                 #     tmp_grad = v.grad.detach()
+        #                 #     if len(tmp_grad.shape)==1:
+        #                 #         tmp_grad = tmp_grad.unsqueeze(0)
+                                
+        #                 #     if k not in lambda_l:
+        #                 #         lambda_l[k] = torch.mean(tmp_grad**2)
+        #                 #     else:
+        #                 #         lambda_l[k] += torch.mean(tmp_grad**2)
+        #                 #     skip_fg = False
+        #                 #     del v.grad, tmp_grad
+
+        #             if "lora_A" in k:
+        #                 tmp_grad = v.grad.detach()
+        #                 if len(tmp_grad.shape)==1:
+        #                     tmp_grad = tmp_grad.unsqueeze(0)
+        #                 #print(torch.mean(tmp_grad**2))
+        #                 if k not in lambda_l:
+        #                     lambda_l[k] = torch.mean(tmp_grad**2)
+        #                 else:
+        #                     lambda_l[k] += torch.mean(tmp_grad**2)
+        #                 skip_fg = False
+        #                 del v.grad, tmp_grad
+                    
+        #             elif "lora_B" in k:
+        #                 tmp_grad = v.grad.detach().T
+        #                 if len(tmp_grad.shape)==1:
+        #                     tmp_grad = tmp_grad.unsqueeze(0)
+        #                 if k not in lambda_l:
+        #                     lambda_l[k] = torch.mean(tmp_grad**2)
+        #                 else:
+        #                     lambda_l[k] += torch.mean(tmp_grad**2)
+        #                 skip_fg = False
+        #                 del v.grad, tmp_grad
+                
+        #         if skip_fg:
+        #             continue
+
+        #         cnt+=1
+
+        #         # if cnt>=10:
+        #         #     break
+
+        #         del output, loss
+        #         torch.cuda.empty_cache()
+            
+        #     for weight_name in lambda_l.keys():
+        #         lambda_l[weight_name] = lambda_l[weight_name]/cnt/lambda_const
+            
+
+        cnt=0
+
+        '''
+        if method != 'hessian_free':
             for tr_idx, batch in enumerate(tqdm(train_dataloader)):
+                # [Contract] self.vlm.forward() must automatically compute `loss` and return!
+                
             
                 self.llm.zero_grad(set_to_none=True)
                 skip_fg = True
@@ -1028,193 +1329,328 @@ class TrainingStrategyLLM(ABC):
                 loss.backward()
                 
 
-                for k,v, in self.llm.llm_backbone.named_parameters():
-                    if v.grad is not None:
-        
-                        if "layers.31" in k:
+                for k,v in self.llm.llm_backbone.named_parameters():
+                
+                    # if "layers.31" in k:
+                    #     tmp_grad = v.grad.detach()
+
+                    if "lora_A" in k or "lora_B" in k:
+                        if "lora_A" in k:
                             tmp_grad = v.grad.detach()
-                            if len(tmp_grad.shape)==1:
-                                tmp_grad = tmp_grad.unsqueeze(0)
-                                
+                        else:
+                            tmp_grad = v.grad.detach().T
+                        
+                        del v.grad
+                        if len(tmp_grad.shape)==1:
+                            tmp_grad = tmp_grad.unsqueeze(0)
+                        
+                        if method == "hyperinf" or method == "lissa" or method == "all":
+                            if k not in G_l:
+                                G_l[k] = tmp_grad.T @ tmp_grad
+                            else:
+                                G_l[k] += tmp_grad.T @ tmp_grad
+                            
+                            # if method != "all":
                             if k not in lambda_l:
                                 lambda_l[k] = torch.mean(tmp_grad**2)
                             else:
                                 lambda_l[k] += torch.mean(tmp_grad**2)
-                            skip_fg = False
-                            del v.grad, tmp_grad
-                
-                if skip_fg:
-                    continue
+                    
 
+                        if method == "datainf":
+                            if k not in ratio_l:
+                                ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                            else:
+                                ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
+                            
+
+                        del tmp_grad
+                
                 cnt+=1
+
+                # if cnt>=10:
+                #     break
+
+
                 del output, loss
                 torch.cuda.empty_cache()
             
-            for weight_name in lambda_l.keys():
-                lambda_l[weight_name] = lambda_l[weight_name]/cnt/lambda_const
-            
-
-        cnt=0
-
-        for tr_idx, batch in enumerate(tqdm(train_dataloader)):
-            # [Contract] self.vlm.forward() must automatically compute `loss` and return!
-            
-           
-            self.llm.zero_grad(set_to_none=True)
-            skip_fg = True
-            output: CausalLMOutputWithPast = self.llm(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-            )
-            loss = output.loss
-            if loss.requires_grad == False:
-                loss.requires_grad_(True)
-            loss.backward()
-            
-
-            for k,v in self.llm.llm_backbone.named_parameters():
-            
-                if "layers.31" in k:
-                    tmp_grad = v.grad.detach()
-                    del v.grad
-                    if len(tmp_grad.shape)==1:
-                        tmp_grad = tmp_grad.unsqueeze(0)
-                    
-                    if method == "hyperinf" or method == "lissa":
-                        if k not in G_l:
-                            G_l[k] = tmp_grad.T @ tmp_grad
-                        else:
-                            G_l[k] += tmp_grad.T @ tmp_grad
-                        
-                        if k not in lambda_l:
-                            lambda_l[k] = torch.mean(tmp_grad**2)
-                        else:
-                            lambda_l[k] += torch.mean(tmp_grad**2)
-                   
-
-                    elif method == "datainf":
-                        if k not in ratio_l:
-                            ratio_l[k] = (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
-                        else:
-                            ratio_l[k] += (tmp_grad.T @ tmp_grad) / (lambda_l[k] + torch.sum(tmp_grad**2))
-                        
-
-                    del tmp_grad
-            
-            cnt+=1
-
-
-            del output, loss
-            torch.cuda.empty_cache()
-        
 
         ####################### HyperINF method ############################
-        if method == "hyperinf":
+        if method == "hyperinf" or method == "all":
+
+            #if method != "all":
             for weight_name in lambda_l.keys():
                 lambda_l[weight_name] = lambda_l[weight_name]/cnt/lambda_const
-            
+        
             hvp_iter_dict = {}
+            h_iter_dict = {}
             for weight_name in G_l.keys():
                 G_l[weight_name] = G_l[weight_name]/cnt + lambda_l[weight_name]*torch.eye(G_l[weight_name].shape[0], device=G_l[weight_name].device)
                 G_l_inv[weight_name] = schulz_inverse_stable(G_l[weight_name], damping_factor=0, max_iterations=30, tol=1e-6)
+                
             
             for weight_name in G_l_inv.keys():
-                hvp_iter_dict[weight_name] = val_grad_dict_avg[weight_name] @ G_l_inv[weight_name]
+                h_iter_dict[weight_name] = G_l_inv[weight_name]
+                #hvp_iter_dict[weight_name] = val_grad_dict_avg[weight_name] @ G_l_inv[weight_name]
             
-            hvp_dict['hyperinf'] = hvp_iter_dict
-            del G_l, G_l_inv, hvp_iter_dict
+            # hvp_dict['hyperinf'] = hvp_iter_dict
+            h_dict['hyperinf'] = h_iter_dict
+            del  G_l_inv, hvp_iter_dict, h_iter_dict
             gc.collect()
         
         ###################### LISSA method ############################
-        if method == "lissa":
+        if method == "lissa" or method == "all":
+
+            #if method != "all":
             for weight_name in lambda_l.keys():
                 lambda_l[weight_name] = lambda_l[weight_name]/cnt/lambda_const
 
             hvp_lissa_dict = {}
+            h_lissa_dict = {}
+            # for weight_name in G_l.keys():
+            #     G_l[weight_name] = G_l[weight_name]/cnt + lambda_l[weight_name]*torch.eye(G_l[weight_name].shape[0], device=G_l[weight_name].device)
+            #     N_iter = 10
+            #     r_l = val_grad_dict_avg[weight_name]
+            #     for _ in range(N_iter):
+            #         r_l = val_grad_dict_avg[weight_name] + r_l @ (torch.eye(G_l[weight_name].shape[0], device=G_l[weight_name].device) - G_l[weight_name])
+            #     hvp_lissa_dict[weight_name] = r_l
+            #     del r_l, N_iter
+            # hvp_dict['lissa'] = hvp_lissa_dict
+
             for weight_name in G_l.keys():
                 G_l[weight_name] = G_l[weight_name]/cnt + lambda_l[weight_name]*torch.eye(G_l[weight_name].shape[0], device=G_l[weight_name].device)
-                N_iter = 10
-                r_l = val_grad_dict_avg[weight_name]
-                for _ in range(N_iter):
-                    r_l = val_grad_dict_avg[weight_name] + r_l @ (torch.eye(G_l[weight_name].shape[0], device=G_l[weight_name].device) - G_l[weight_name])
-                hvp_lissa_dict[weight_name] = r_l
-                del r_l, N_iter
-                
+                h_lissa_dict[weight_name] = G_l[weight_name]
+            
+            h_dict['lissa'] = h_lissa_dict
 
-            hvp_dict['lissa'] = hvp_lissa_dict
-            del G_l, hvp_lissa_dict
+            del G_l, hvp_lissa_dict, h_lissa_dict
+            gc.collect()
         
 
 
         # ######################## DATAINF method ############################
         if method == "datainf":
             hvp_datainf_dict = {}
-            for weight_name in ratio_l.keys():
-                hvp_datainf_dict[weight_name] = 1 / lambda_l[weight_name] * (val_grad_dict_avg[weight_name] - val_grad_dict_avg[weight_name] @ ratio_l[weight_name] / cnt)
-            hvp_dict['datainf'] = hvp_datainf_dict
+            h_datainf_dict = {}
 
-            del ratio_l, hvp_datainf_dict
+            # for weight_name in ratio_l.keys():
+            #     hvp_datainf_dict[weight_name] = 1 / lambda_l[weight_name] * (val_grad_dict_avg[weight_name] - val_grad_dict_avg[weight_name] @ ratio_l[weight_name] / cnt)
+            # hvp_dict['datainf'] = hvp_datainf_dict
+
+            for weight_name in ratio_l.keys():
+                ## remove the val_grad_dict_avg[weight_name] from the hessian
+                h_datainf_dict[weight_name] = 1 / lambda_l[weight_name] * (torch.eye(ratio_l[weight_name].shape[0], device=ratio_l[weight_name].device) - ratio_l[weight_name] / cnt)
+            
+            h_dict['datainf'] = h_datainf_dict
+
+            del ratio_l, hvp_datainf_dict, h_datainf_dict
             gc.collect()
         # ######################## DATAINF method ############################
 
 
         ########################## Hessian-Free method ############################
         if method == "hessian_free":
-            hvp_dict['hessian_free'] = val_grad_dict_avg
-            del val_grad_dict_avg
-            gc.collect()
+            pass
+            # hvp_dict['hessian_free'] = val_grad_dict_avg
+            # del val_grad_dict_avg
+            # gc.collect()
         ########################## Hessian-Free method ############################
+        '''
+
+        ## save h_dict
+        # with open(run_dir / f"h_dict_{method}.pkl", "wb") as f:
+        #     pickle.dump(h_dict, f)
+
+        # load h_dict
+        with open(run_dir / f"h_dict_{method}.pkl", "rb") as f:
+            h_dict = pickle.load(f)
+
         
-
-
-
-        ########################### compute IF score ############################
+        with open(run_dir / "piqa_val_grad_dict.pkl", "rb") as f:
+            piqa_val_grad_dict = pickle.load(f)
+        with open(run_dir / "logiqa_val_grad_dict.pkl", "rb") as f:
+            logiqa_val_grad_dict = pickle.load(f)
+        with open(run_dir / "qasc_val_grad_dict.pkl", "rb") as f:
+            qasc_val_grad_dict = pickle.load(f)
+        with open(run_dir / "hellaswag_val_grad_dict.pkl", "rb") as f:
+            hellaswag_val_grad_dict = pickle.load(f)
         
-        IF_dict = {}
-        for mtd in hvp_dict.keys():
-            if_tmp_dict = {}
-            cnt=0
-            for tr_id, batch in enumerate(tqdm(train_dataloader)): # iterate over the training dataset
-                
-                self.llm.zero_grad(set_to_none=True)
-                skip_fg = True
-                output: CausalLMOutputWithPast = self.llm(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-                loss = output.loss
-                if loss.requires_grad == False:
-                    loss.requires_grad_(True)
-                loss.backward()
-                
-                ## we only store the gradients of the trainable modules
-                if_tmp_score = 0
+        #val_datasets = ['piqa', 'logiqa', 'qasc']#, 'hellaswag']
+        val_datasets = ['hellaswag']
+        #all_methods = ['lissa', 'hyperinf','hessian_free']
+        all_methods = [method]
 
-                for k,v in self.llm.llm_backbone.named_parameters():
-                  
-                    if  "layers.31" in k:
-                        tmp_grad = v.grad.detach()
-                        if len(tmp_grad.shape)==1:
-                            tmp_grad = tmp_grad.unsqueeze(0)
-                        if_tmp_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
-                        skip_fg = False
-                        del v.grad, tmp_grad
+        for val_name in val_datasets:
+
+            if val_name == 'piqa':
+                val_grad_dict_avg = piqa_val_grad_dict
+            elif val_name == 'logiqa':
+                val_grad_dict_avg = logiqa_val_grad_dict
+            elif val_name == 'qasc':
+                val_grad_dict_avg = qasc_val_grad_dict
+            elif val_name == 'hellaswag':
+                val_grad_dict_avg = hellaswag_val_grad_dict
+            
+
+            hvp_dict = {}
+
+            for method_name in all_methods:
+                if method_name == 'hessian_free':
+                    hvp_dict['hessian_free'] = val_grad_dict_avg
+
+                elif method_name == 'lissa':
+                    hvp_lissa_dict = {}
+
+                    for weight_name in h_dict[method_name].keys():
+                        G_l = h_dict[method_name][weight_name]
+                        N_iter=10
+                        r_l = val_grad_dict_avg[weight_name]
+                        for _ in range(N_iter):
+                            r_l = val_grad_dict_avg[weight_name] + r_l @ (torch.eye(G_l.shape[0], device=G_l.device) - G_l)
+                        hvp_lissa_dict[weight_name] = r_l
+                        del r_l, N_iter
+                    hvp_dict['lissa'] = hvp_lissa_dict
+                    del hvp_lissa_dict
+                
+                elif method_name == 'datainf':
+                    hvp_datainf_dict = {}
+                    for weight_name in h_dict[method_name].keys():
+                        tmp = h_dict[method_name][weight_name]
+                        hvp_datainf_dict[weight_name] = val_grad_dict_avg[weight_name] @ tmp
+                        del tmp
+                    hvp_dict['datainf'] = hvp_datainf_dict
+                    del hvp_datainf_dict
+                
+                elif method_name == 'hyperinf':
+                    hvp_hyperinf_dict = {}
+                    for weight_name in h_dict[method_name].keys():
+                        tmp = h_dict[method_name][weight_name]
+                        hvp_hyperinf_dict[weight_name] = val_grad_dict_avg[weight_name] @ tmp
+                        del tmp
+                    hvp_dict['hyperinf'] = hvp_hyperinf_dict
+                    del hvp_hyperinf_dict
+
+            IF_dict = {}
+
+
+    ########################### compute IF score ############################
+    
+    
+            for mtd in hvp_dict.keys():
+                if_tmp_dict = {}
+                cnt=0
+
+                print("METHOD: ", mtd)
+
+                for tr_id, batch in enumerate(tqdm(train_dataloader)): # iterate over the training dataset
+                    
+                    self.llm.zero_grad(set_to_none=True)
+                    skip_fg = True
+                    output: CausalLMOutputWithPast = self.llm(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                    loss = output.loss
+                    if loss.requires_grad == False:
+                        loss.requires_grad_(True)
+                    loss.backward()
+                    
+                    ## we only store the gradients of the trainable modules
+                    if_tmp_score = 0
+
+                    for k,v in self.llm.llm_backbone.named_parameters():
+                    
+                        # if  "layers.31" in k:
+                        #     tmp_grad = v.grad.detach()
+
+                        if "lora_A" in k or "lora_B" in k:
+                            if "lora_A" in k:
+                                tmp_grad = v.grad.detach()
+                            else:
+                                tmp_grad = v.grad.detach().T
+
+                            del v.grad
+                            if len(tmp_grad.shape)==1:
+                                tmp_grad = tmp_grad.unsqueeze(0)
+                            if_tmp_score += torch.sum(hvp_dict[mtd][k] * tmp_grad)
+                            skip_fg = False
+                            del v.grad, tmp_grad
+
+                        
+
+                    cnt+=1
+
+                    # if cnt>=10:
+                    #     break
+
+                    print(-if_tmp_score)
+                    if_tmp_dict[tr_id] = -if_tmp_score.cpu().detach().numpy()
+
+                    
+                    del output, loss                
+                    torch.cuda.empty_cache()
+                
+                IF_dict[mtd] = pd.Series(if_tmp_dict, dtype=float).to_numpy()
+            
+
+            for method in IF_dict.keys():
+                if_dict = IF_dict[method]
+                with open(run_dir / f"{val_name}_{method}_IF_dict.pkl", "wb") as f:
+                    pickle.dump(if_dict, f)
+                
+                # with open(run_dir / f"{val_name}_{method}_IF_dict.pkl", "rb") as f:
+                #     if_dict = pickle.load(f)
+
+                Highquality_to_Lowquality = np.argsort(if_dict)
+
+                with open(run_dir / f"{val_name}_{method}_Highquality_to_Lowquality.pkl", "wb") as f:
+                    pickle.dump(Highquality_to_Lowquality, f)
+                
+                # with open(run_dir / f"{val_name}_{method}_Highquality_to_Lowquality.pkl", "rb") as f:
+                #     Highquality_to_Lowquality = pickle.load(f)
+
+                # with open(run_dir / "IF_dict.pkl", "rb") as f:
+                #     if_dict = pickle.load(f)
+                # with open(run_dir / "Highquality_to_Lowquality.pkl", "rb") as f:
+                #     Highquality_to_Lowquality = pickle.load(f)
+
+                overwatch.info("Data Pruning Done")
+
+                n_train = len(Highquality_to_Lowquality)
+                ratios = [0.05, 0.2, 0.4]
+
+                # with open(train_jsonl, "r") as f:
+                #     data = f.readlines()
+                if "jsonl" in str(train_jsonl):
+                    with open(train_jsonl, "r") as f:
+                        data = f.readlines()
+                elif "json" in str(train_jsonl):
+                    with open(train_jsonl, "r") as f:
+                        data = json.load(f)
+                
+
+                for ratio in ratios:
+                    perct = int(ratio * 100)
+                    top_k = int(n_train * ratio)
+                    Highquality_to_Lowquality_topk = Highquality_to_Lowquality[:top_k]
+
+                    if "jsonl" in str(train_jsonl):
+                        with open(f"data/train/processed/oasst1/lora_{val_name}_{method}_{perct}.jsonl", "w") as f:
+                            for i in Highquality_to_Lowquality_topk:
+                                f.write(data[i])
+                    elif "json" in str(train_jsonl):
+                        new_data = []
+                        for i in Highquality_to_Lowquality_topk:
+                            new_data.append(data[i])
+                        with open(f"data/train/processed/oasst1/lora_{val_name}_{method}_{perct}.json", "w") as f:
+                            json.dump(new_data, f)
 
                     
 
-                cnt+=1
-
-                print(-if_tmp_score)
-                if_tmp_dict[tr_id] = -if_tmp_score.cpu().detach().numpy()
 
                 
-                del output, loss                
-                torch.cuda.empty_cache()
-            
-            IF_dict[mtd] = pd.Series(if_tmp_dict, dtype=float).to_numpy()
-        
         return IF_dict
         
 

@@ -23,6 +23,7 @@ DATASET_INITIALIZER = {"align": AlignDataset,
                        "llm-finetune": LLMFinetuneDataset,
                           "llama-dataset-pruning": LLMFinetuneDataset,
                           "inference": LLMFinetuneDataset,
+                          "llama-lora-dataset-pruning": LLMFinetuneDataset,
                        }
 
 
@@ -45,17 +46,24 @@ def get_dataset_and_collator_LLM(
 
     train_jsonl, train_dir = dataset_cfg.finetune_stage_components
     val_jsonl, val_dir = dataset_cfg.val_components
+    #val_jsonl, val_dir = None, None
 
     train_dataset = train_dataset_cls(
+        True,
         dataset_root_dir / train_jsonl,
         tokenizer,
         prompt_builder_fn=prompt_builder_fn,
     )
+
+    #val_dataset = None
     val_dataset = val_dataset_cls(
+        True,
         dataset_root_dir / val_jsonl,
         tokenizer,
         prompt_builder_fn=prompt_builder_fn,
     )
+
+
     return train_dataset, val_dataset, collator, dataset_root_dir/train_jsonl, dataset_root_dir/val_jsonl
 
 
