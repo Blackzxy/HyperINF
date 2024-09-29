@@ -6,7 +6,7 @@ This repo contains two main parts for paper HyperINF:
 ## Mislabeled Data Detection
 In this task, we use the code of [DataInf](https://github.com/ykwon0407/DataInf) and compare our HyperINF with the privided baselines. Our implementation of HyperINF can be found in `HyperINF/Mislabeled_Data_Detection/src/influence.py`. 
 
-You can run `python Mislabeled_Data_Detection/test.py` to see the performance comparision among all the methods. We also provide the result of detection on `COLA` dataset as an example in the image `cola_r=16_detection_rate.pdf`.
+You can run `python Mislabeled_Data_Detection/test.py` to see the performance comparision among all the methods. We also provide the result of detection on `COLA` dataset as an example in the image `cola_r=16_detection_rate.pdf`. `time_inverse.ipynb` is used for Mislabeled Data Detection illustration, and time cost for inverse matrix computation among Schulz and other popular algorithms.s
 
 
 ## Data Selection for LLM and VLM
